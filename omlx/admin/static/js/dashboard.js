@@ -3775,6 +3775,11 @@
                 this.startHFDownload();
             },
 
+            isModelDownloaded(repoId) {
+                const name = repoId.split('/').pop();
+                return this.hfModels.some(m => m.name === name || m.name === repoId.replace('/', '--'));
+            },
+
             getMemoryFitStatus(sizeBytes) {
                 const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
                 if (!totalBytes || !sizeBytes) return 'safe';

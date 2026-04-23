@@ -111,7 +111,7 @@ class CodexIntegration(Integration):
     def launch(self, port: int, api_key: str, model: str, host: str = "127.0.0.1", **kwargs) -> None:
         self.configure(port, api_key, model, host=host)
 
-        env = os.environ.copy()
+        env = self._clean_launch_env()
         env["OMLX_API_KEY"] = api_key or "omlx"
 
         args = ["codex"]

@@ -77,3 +77,16 @@ class Integration:
             encoding="utf-8",
         )
         print(f"Config written: {config_path}")
+
+    @staticmethod
+    def _clean_launch_env() -> dict[str, str]:
+        """Return a copy of the environment with oMLX app bundle Python vars removed.
+
+        When launched from the macOS app bundle, PYTHONHOME/PYTHONPATH point to
+        the bundled Python runtime. Child processes (e.g. MCP servers using uv)
+        must not inherit these or their own Python environments break.
+        """
+        env = os.environ.copy()
+        for var in ("PYTHONHOME", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "VIRTUAL_ENV", "PYTHONNOUSERSITE"):
+            env.pop(var, None)
+        return env

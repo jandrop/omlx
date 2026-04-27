@@ -33,25 +33,22 @@ _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
 
 def _init_mlx_thread() -> None:
-    """Move mlx_lm.generate.generation_stream into the executor thread.
+    """Replace generation_stream with a thread-local stream on the executor thread.
 
-    generation_stream is created at mlx_lm.generate import time in whichever
-    thread imports it first (the main thread when omlx.scheduler is imported
-    at server startup).  All MLX GPU ops are serialized onto this executor
-    thread, and arrays produced inside `with mx.stream(generation_stream):`
-    blocks carry that stream reference — subsequent .item() / mx.synchronize()
-    calls then try to resolve the main thread's stream object from this thread
-    and fail with "There is no Stream(gpu, 0) in current thread".
+    mlx-lm's module-level ``generation_stream`` is created at import time in
+    whichever thread imported it first (the main thread at server startup).
+    Arrays produced inside ``with mx.stream(generation_stream):`` blocks carry
+    that stream reference.  If the stream was created on the main thread,
+    subsequent ``.item()`` / ``mx.synchronize()`` calls from the executor
+    thread fail with "There is no Stream(gpu, 0) in current thread".
 
-    Fix: on executor-thread init, create a new Metal stream HERE and replace
-    the module-level generation_stream in both mlx_lm.generate and
-    omlx.scheduler (which imported it by name).  This runs before any model is
-    loaded, so subsequent BatchGenerator ops tag arrays with the new stream.
+    Fix: create a thread-local stream HERE and replace the module-level
+    ``generation_stream`` in mlx_lm.generate and omlx.scheduler.
     """
     import sys
     import mlx.core as mx
 
-    stream = mx.new_stream(mx.gpu)
+    stream = mx.new_thread_local_stream(mx.default_device())
 
     gen_mod = sys.modules.get("mlx_lm.generate")
     if gen_mod is not None:

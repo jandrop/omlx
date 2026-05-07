@@ -62,6 +62,8 @@ from Foundation import (
     NSURL,
 )
 
+from omlx.utils.release_check import select_latest_stable_release
+
 from .config import ServerConfig
 from .server_manager import PortConflict, ServerManager, ServerStatus
 
@@ -210,6 +212,9 @@ class OMLXAppDelegate(NSObject):
 
         logger.info("oMLX menubar app launched successfully")
 
+        # Install omlx CLI symlink so `omlx launch claude` works from the terminal
+        self._install_cli_symlink()
+
         # Clean up leftover staged update from previous attempt
         from .updater import AppUpdater
 
@@ -243,6 +248,40 @@ class OMLXAppDelegate(NSObject):
                 3.0, self, "checkStatusItemVisibility:", None, False
             )
         )
+
+    def _install_cli_symlink(self) -> None:
+        """Install `omlx` CLI symlink so it's available in PATH.
+
+        Tries /usr/local/bin first (like ollama), falls back to ~/.local/bin.
+        Silently skips if neither directory is writable or the symlink already exists.
+        """
+        bundle = NSBundle.mainBundle()
+        exec_url = bundle.executableURL()
+        if exec_url is None:
+            return
+
+        macos_dir = Path(str(exec_url.path())).parent
+        cli_src = macos_dir / "omlx-cli"
+        if not cli_src.exists():
+            return
+
+        for target_dir in [Path("/usr/local/bin"), Path.home() / ".local" / "bin"]:
+            target = target_dir / "omlx"
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                if target.is_symlink():
+                    if target.resolve() == cli_src.resolve():
+                        return  # already correct
+                    target.unlink()
+                elif target.exists():
+                    return  # non-symlink file present, don't overwrite
+                target.symlink_to(cli_src)
+                logger.info(f"Installed CLI symlink: {target} → {cli_src}")
+                return
+            except OSError:
+                continue
+
+        logger.warning("Could not install omlx CLI symlink — no writable bin directory found")
 
     def _create_status_item(self):
         """Create the NSStatusItem and set accessibility metadata.
@@ -988,28 +1027,35 @@ class OMLXAppDelegate(NSObject):
             return  # Use cached result
 
         try:
-            # GitHub Releases API
+            # Pull a page of releases instead of /releases/latest. GitHub's
+            # "latest" endpoint only honors the prerelease flag, but dev/rc
+            # tags here have historically been published with that flag
+            # unset. Pick the latest stable PEP 440 tag from the list.
             resp = requests.get(
-                "https://api.github.com/repos/jundot/omlx/releases/latest",
+                "https://api.github.com/repos/jundot/omlx/releases",
+                params={"per_page": 20},
                 timeout=5,
             )
             if resp.status_code == 200:
-                data = resp.json()
-                latest = data["tag_name"].lstrip("v")
-                current = __version__
+                data = select_latest_stable_release(resp.json())
+                if data is not None:
+                    latest = data["tag_name"].lstrip("v")
+                    current = __version__
 
-                if self._is_newer_version(latest, current):
-                    # Find DMG asset matching current macOS version
-                    dmg_url = _find_matching_dmg(data.get("assets", []))
+                    if self._is_newer_version(latest, current):
+                        # Find DMG asset matching current macOS version
+                        dmg_url = _find_matching_dmg(data.get("assets", []))
 
-                    self._update_info = {
-                        "version": latest,
-                        "url": data["html_url"],
-                        "dmg_url": dmg_url,
-                        "notes": data.get("body", ""),
-                    }
-                    logger.info(f"Update available: {latest}")
-                    self._build_menu()
+                        self._update_info = {
+                            "version": latest,
+                            "url": data["html_url"],
+                            "dmg_url": dmg_url,
+                            "notes": data.get("body", ""),
+                        }
+                        logger.info(f"Update available: {latest}")
+                        self._build_menu()
+                    else:
+                        self._update_info = None
                 else:
                     self._update_info = None
             else:
@@ -1021,12 +1067,11 @@ class OMLXAppDelegate(NSObject):
             self._update_info = None
 
     def _is_newer_version(self, latest: str, current: str) -> bool:
-        """PEP 440 version comparison. Ignores pre-release versions."""
+        """PEP 440 version comparison. Caller must pre-filter prereleases."""
         try:
             from packaging.version import Version
 
-            latest_ver = Version(latest)
-            return latest_ver > Version(current) and not latest_ver.is_prerelease
+            return Version(latest) > Version(current)
         except Exception:
             return False
 

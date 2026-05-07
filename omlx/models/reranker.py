@@ -26,6 +26,9 @@ from ..model_discovery import (
     _is_causal_lm_reranker,
 )
 from ..utils.image import load_image
+from .mlx_embeddings_compat import (
+    patch_qwen3_vl_processor_for_torch_free_image_loading,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,14 +91,17 @@ class MLXRerankerModel:
         "Given a web search query, retrieve relevant passages that answer the query"
     )
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, trust_remote_code: bool = False):
         """
         Initialize the MLX reranker model.
 
         Args:
             model_name: HuggingFace model name or local path
+            trust_remote_code: Allow execution of custom Python shipped inside
+                the model repository. Off by default for security (issue #926).
         """
         self.model_name = model_name
+        self.trust_remote_code = trust_remote_code
 
         self.model = None
         self.processor = None
@@ -167,7 +173,9 @@ class MLXRerankerModel:
         mx.eval(model.parameters())
 
         # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(model_path), trust_remote_code=self.trust_remote_code
+        )
 
         return model, tokenizer
 
@@ -178,9 +186,13 @@ class MLXRerankerModel:
         handles both embedding and reranking variants of Qwen3-VL. Reranker vs
         embedder is decided by the input dict shape at inference time.
         """
+        patch_qwen3_vl_processor_for_torch_free_image_loading()
         from mlx_embeddings import load as mlx_emb_load
 
-        return mlx_emb_load(str(self.model_name))
+        return mlx_emb_load(
+            str(self.model_name),
+            tokenizer_config={"trust_remote_code": self.trust_remote_code},
+        )
 
     def _build_vl_item(
         self, item: "str | dict[str, Any]"
@@ -249,7 +261,10 @@ class MLXRerankerModel:
         from mlx_lm import load as mlx_lm_load
 
         model_path = str(self.model_name)
-        loaded = mlx_lm_load(model_path)
+        loaded = mlx_lm_load(
+            model_path,
+            tokenizer_config={"trust_remote_code": self.trust_remote_code},
+        )
         model = loaded[0]
         tokenizer_wrapper = loaded[1]
 
@@ -310,7 +325,10 @@ class MLXRerankerModel:
         from mlx_lm import load as mlx_lm_load
 
         model_path = str(self.model_name)
-        loaded = mlx_lm_load(model_path)
+        loaded = mlx_lm_load(
+            model_path,
+            tokenizer_config={"trust_remote_code": self.trust_remote_code},
+        )
         model = loaded[0]
         tokenizer_wrapper = loaded[1]
 
@@ -597,9 +615,13 @@ class MLXRerankerModel:
                 self._num_labels = getattr(self.model.config, "num_labels", None)
             else:
                 # Use mlx-embeddings for other architectures (ModernBert, etc.)
+                patch_qwen3_vl_processor_for_torch_free_image_loading()
                 from mlx_embeddings import load
 
-                self.model, self.processor = load(self.model_name)
+                self.model, self.processor = load(
+                    self.model_name,
+                    tokenizer_config={"trust_remote_code": self.trust_remote_code},
+                )
 
                 # Get num_labels from model config
                 if hasattr(self.model, "config"):

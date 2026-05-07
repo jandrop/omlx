@@ -414,7 +414,7 @@ app = FastAPI(
 # Include MCP routes
 from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
-app.include_router(mcp_router)
+app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])
 
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
@@ -422,7 +422,7 @@ app.include_router(mcp_router)
 try:
     import mlx_audio as _  # noqa: F401
     from .api.audio_routes import router as audio_router
-    app.include_router(audio_router)
+    app.include_router(audio_router, dependencies=[Depends(verify_api_key)])
     del _
 except ImportError:
     pass
@@ -696,8 +696,52 @@ async def get_engine(
                 detail=f"Model '{model_id}' is not a reranker model. "
                 f"Use a SequenceClassification model for reranking."
             )
+    elif engine_type == EngineType.LLM:
+        # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
+        # fell through and crashed on `engine.model_type` with an unhandled
+        # 500. Reject with a clear 400 pointing the caller at the right
+        # endpoint.
+        if not isinstance(engine, BaseEngine):
+            _endpoint_hint = _suggest_endpoint_for_engine(engine)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{model_id}' is not an LLM / chat model. "
+                    f"{_endpoint_hint}"
+                ),
+            )
 
     return engine
+
+
+def _suggest_endpoint_for_engine(engine: object) -> str:
+    """Return a one-line hint pointing at the correct endpoint for a non-LLM engine."""
+    # Import audio engine classes lazily so that oMLX without the [audio]
+    # extra still imports this module.
+    try:
+        from omlx.engine.stt import STTEngine
+    except Exception:  # pragma: no cover - defensive
+        STTEngine = None  # type: ignore[assignment]
+    try:
+        from omlx.engine.tts import TTSEngine
+    except Exception:  # pragma: no cover - defensive
+        TTSEngine = None  # type: ignore[assignment]
+    try:
+        from omlx.engine.sts import STSEngine
+    except Exception:  # pragma: no cover - defensive
+        STSEngine = None  # type: ignore[assignment]
+
+    if STTEngine is not None and isinstance(engine, STTEngine):
+        return "Use /v1/audio/transcriptions for speech-to-text models."
+    if TTSEngine is not None and isinstance(engine, TTSEngine):
+        return "Use /v1/audio/speech for text-to-speech models."
+    if STSEngine is not None and isinstance(engine, STSEngine):
+        return "Use /v1/audio/process for speech-to-speech / audio processing models."
+    if isinstance(engine, EmbeddingEngine):
+        return "Use /v1/embeddings for embedding models."
+    if isinstance(engine, RerankerEngine):
+        return "Use /v1/rerank for reranker models."
+    return "Use the model's dedicated endpoint (see /v1/models)."
 
 
 async def get_engine_for_model(model: str | None = None) -> BaseEngine:
@@ -1240,6 +1284,46 @@ def init_server(
 
 _KEEPALIVE_SENTINEL = object()
 
+_KEEPALIVE_COMMENT = ": keep-alive\n\n"
+_KEEPALIVE_CHAT_CHUNK = (
+    'data: {"id":"chatcmpl-keepalive","object":"chat.completion.chunk",'
+    '"created":0,"model":"keepalive",'
+    '"choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n'
+)
+_KEEPALIVE_COMPLETION_CHUNK = (
+    'data: {"id":"cmpl-keepalive","object":"text_completion","created":0,'
+    '"model":"keepalive",'
+    '"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}\n\n'
+)
+_KEEPALIVE_ANTHROPIC_PING = 'event: ping\ndata: {"type":"ping"}\n\n'
+
+
+def _resolve_keepalive(protocol: str) -> Optional[str]:
+    """Pick a wire-level keepalive frame for the given API protocol.
+
+    Returns None when the configured mode disables keepalive for this protocol.
+    Modes: "chunk" (default, protocol-aware), "comment" (legacy SSE comment),
+    "off" (no keepalive). Some clients (e.g. OpenClaw / WorkBuddy) cannot parse
+    SSE comment lines, so the chunk mode emits valid no-op events instead.
+    """
+    global_settings = _server_state.global_settings
+    mode = "chunk"
+    if global_settings is not None:
+        mode = getattr(global_settings.server, "sse_keepalive_mode", "chunk")
+    if mode == "off":
+        return None
+    if mode == "comment":
+        return _KEEPALIVE_COMMENT
+    if protocol == "openai_chat":
+        return _KEEPALIVE_CHAT_CHUNK
+    if protocol == "openai_completion":
+        return _KEEPALIVE_COMPLETION_CHUNK
+    if protocol == "anthropic":
+        return _KEEPALIVE_ANTHROPIC_PING
+    if protocol == "openai_responses":
+        return None
+    return None
+
 
 async def _safe_anext(ait):
     """Wrapper for __anext__ that converts StopAsyncIteration to a sentinel.
@@ -1258,13 +1342,16 @@ async def _with_sse_keepalive(
     http_request: Optional["FastAPIRequest"] = None,
     interval: float = 10.0,
     disconnect_poll: float = 2.0,
+    keepalive_chunk: Optional[str] = _KEEPALIVE_COMMENT,
 ) -> AsyncIterator[str]:
-    """Wrap an SSE generator to send periodic keep-alive comments.
+    """Wrap an SSE generator to send periodic keepalive frames.
 
     During long prefill (e.g. 90k tokens), no SSE events are emitted,
     causing clients with read timeouts (like Claude Code) to disconnect.
-    This wrapper sends SSE comments (: keep-alive) that are ignored by
-    SSE parsers but keep the HTTP connection alive.
+    This wrapper periodically yields a keepalive frame to hold the
+    connection open. The frame format depends on caller-supplied
+    keepalive_chunk: a legacy SSE comment, a protocol-aware no-op event,
+    or None to disable emission entirely.
 
     When http_request is provided, also polls for client disconnect
     between prefill steps. This detects cancellation during long prefills
@@ -1277,7 +1364,8 @@ async def _with_sse_keepalive(
 
     # Send initial keepalive immediately so clients with short read
     # timeouts (e.g. openclaw ~15s) don't disconnect during prefill.
-    yield ": keep-alive\n\n"
+    if keepalive_chunk is not None:
+        yield keepalive_chunk
 
     try:
         while True:
@@ -1309,7 +1397,8 @@ async def _with_sse_keepalive(
                 keepalive_elapsed += wait_time
                 if keepalive_elapsed >= interval:
                     keepalive_elapsed = 0.0
-                    yield ": keep-alive\n\n"
+                    if keepalive_chunk is not None:
+                        yield keepalive_chunk
             if task.done():
                 try:
                     result = task.result()
@@ -1584,6 +1673,26 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
     return {"status": "ok", "model_id": model_id}
 
 
+@app.post("/v1/models/{model_id}/load")
+async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
+    """Load a discovered model into memory. Blocks until loading completes."""
+    if _server_state.engine_pool is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    entry = _server_state.engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    if entry.engine is not None:
+        return {"status": "ok", "model_id": model_id, "message": f"Already loaded: {model_id}"}
+
+    try:
+        await _server_state.engine_pool.get_engine(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
+
+
 # =============================================================================
 # Embeddings Endpoint
 # =============================================================================
@@ -1818,6 +1927,7 @@ async def create_completion(
             _with_sse_keepalive(
                 stream_completion(engine, prompts[0], request, model_load_duration=model_load_duration),
                 http_request=http_request,
+                keepalive_chunk=_resolve_keepalive("openai_completion"),
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -2137,6 +2247,7 @@ async def create_chat_completion(
             _with_sse_keepalive(
                 stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, **chat_kwargs),
                 http_request=http_request,
+                keepalive_chunk=_resolve_keepalive("openai_chat"),
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -2982,13 +3093,21 @@ async def stream_anthropic_messages(
                 if thinking_delta:
                     if thinking_filter:
                         thinking_delta = thinking_filter.feed(thinking_delta)
-                    if not thinking_block_started:
-                        if thinking_delta:
+                    if thinking_delta:
+                        # Close any open text block before starting a new
+                        # thinking block at a fresh index. Anthropic SDKs
+                        # reject mixed-type content_block events at the same
+                        # index — this transition handles a model that emits
+                        # a second thinking section after some text.
+                        if text_block_started:
+                            yield create_content_block_stop_event(index=block_index)
+                            block_index += 1
+                            text_block_started = False
+                        if not thinking_block_started:
                             yield create_content_block_start_event(
                                 index=block_index, block_type="thinking"
                             )
                             thinking_block_started = True
-                    if thinking_delta:
                         yield create_thinking_delta_event(
                             index=block_index, thinking=thinking_delta
                         )
@@ -3025,6 +3144,10 @@ async def stream_anthropic_messages(
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
         if thinking_delta:
+            if text_block_started:
+                yield create_content_block_stop_event(index=block_index)
+                block_index += 1
+                text_block_started = False
             if not thinking_block_started:
                 yield create_content_block_start_event(
                     index=block_index, block_type="thinking"
@@ -3034,6 +3157,10 @@ async def stream_anthropic_messages(
     if thinking_filter:
         remaining_thinking = thinking_filter.finish()
         if remaining_thinking:
+            if text_block_started:
+                yield create_content_block_stop_event(index=block_index)
+                block_index += 1
+                text_block_started = False
             if not thinking_block_started:
                 yield create_content_block_start_event(
                     index=block_index, block_type="thinking"
@@ -3379,6 +3506,7 @@ async def create_anthropic_message(
             _with_sse_keepalive(
                 stream_anthropic_messages(engine, messages, request, resolved_model=resolved_model, **chat_kwargs),
                 http_request=http_request,
+                keepalive_chunk=_resolve_keepalive("anthropic"),
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -3449,7 +3577,7 @@ async def create_anthropic_message(
                         pass
 
         response = convert_internal_to_anthropic_response(
-            text=cleaned_text.strip() if cleaned_text else regular_content,
+            text=cleaned_text.strip() if cleaned_text else "",
             model=request.model,
             prompt_tokens=scale_anthropic_tokens(output.prompt_tokens, request.model),
             completion_tokens=scale_anthropic_tokens(output.completion_tokens, request.model),
@@ -3788,6 +3916,7 @@ async def create_response(
                     **chat_kwargs,
                 ),
                 http_request=http_request,
+                keepalive_chunk=_resolve_keepalive("openai_responses"),
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -3880,7 +4009,9 @@ async def create_response(
                     )
                 )
 
-        usage = build_response_usage(output.prompt_tokens, output.completion_tokens)
+        usage = build_response_usage(
+            output.prompt_tokens, output.completion_tokens, output.cached_tokens
+        )
 
         response_obj = ResponseObject(
             model=request.model,
@@ -4261,6 +4392,7 @@ async def stream_responses_api(
             "input_tokens": last_output.prompt_tokens,
             "output_tokens": last_output.completion_tokens,
             "total_tokens": last_output.prompt_tokens + last_output.completion_tokens,
+            "input_tokens_details": {"cached_tokens": last_output.cached_tokens},
             "output_tokens_details": {"reasoning_tokens": 0},
         }
 
